@@ -13,7 +13,7 @@ import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT, format_prompt_template
 from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
@@ -111,47 +111,78 @@ def _resolve_context_len(context_lens: set[int]) -> int:
     return next(iter(context_lens))
 
 
-def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
+def _add_prompt(prompts: list[str], seen: set[str], prompt: str):
+    if prompt not in seen:
+        seen.add(prompt)
+        prompts.append(prompt)
+
+
+def _node_prompt_templates(node: DictConfig) -> tuple[str, str | None]:
+    prompt_template = node.get("prompt_template", DEFAULT_PROMPT)
+    action_prompt_template = node.get("action_prompt_template")
+    return str(prompt_template), None if action_prompt_template is None else str(action_prompt_template)
+
+
+def _read_unique_prompts(data_cfg: DictConfig, override_task: str | None = None) -> list[str]:
     prompts: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     total_task_rows = 0
 
-    for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+    for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
+        raw_dirs = node.get("dataset_dirs")
+        if raw_dirs is None:
+            continue
+        node_override = node.get("override_instruction")
+        node_task_override = override_task
+        if node_task_override is None and node_override is not None and str(node_override).strip():
+            node_task_override = str(node_override).strip()
+        prompt_template, action_prompt_template = _node_prompt_templates(node)
 
-        with tasks_path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
+        for ds_dir in raw_dirs:
+            tasks: list[str] = []
+            if node_task_override is not None:
+                tasks = [node_task_override]
                 total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+            else:
+                tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
+                if not tasks_path.exists():
+                    raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+
+                with tasks_path.open("r", encoding="utf-8") as f:
+                    for line_idx, line in enumerate(f, start=1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        if "task" not in record:
+                            raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
+                        tasks.append(str(record["task"]))
+                        total_task_rows += 1
+
+            for task in tasks:
+                video_prompt = format_prompt_template(prompt_template, task)
+                _add_prompt(prompts, seen, video_prompt)
+                if action_prompt_template is not None:
+                    action_prompt = format_prompt_template(action_prompt_template, task)
+                    _add_prompt(prompts, seen, action_prompt)
+
+        logger.info("Loaded prompts for dataset node `%s`.", node_path)
 
     logger.info(
-        "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
+        "Loaded %d task rows, deduplicated to %d prompts.",
         total_task_rows,
-        len(dataset_dirs),
         len(prompts),
     )
     return prompts
 
 
-def _get_override_prompt(override_instruction: Any) -> str | None:
+def _get_override_task(override_instruction: Any) -> str | None:
     if override_instruction is None:
         return None
     task = str(override_instruction).strip()
     if task == "":
         return None
-    return DEFAULT_PROMPT.format(task=task)
+    return task
 
 
 def _model_id_to_enc_id(model_id: str) -> str:
@@ -192,14 +223,12 @@ def main(cfg: DictConfig):
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
     context_len = _resolve_context_len(context_lens)
-    override_prompt = _get_override_prompt(cfg.get("override_instruction"))
-    if override_prompt is not None:
-        prompts = [override_prompt]
-        logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
-    else:
-        if not dataset_dirs:
-            raise ValueError("No `dataset_dirs` found under `cfg.data`.")
-        prompts = _read_unique_prompts(dataset_dirs)
+    override_task = _get_override_task(cfg.get("override_instruction"))
+    if not dataset_dirs:
+        raise ValueError("No `dataset_dirs` found under `cfg.data`.")
+    prompts = _read_unique_prompts(cfg.data, override_task=override_task)
+    if override_task is not None:
+        logger.info("Using top-level override_instruction while preserving per-dataset prompt templates.")
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return

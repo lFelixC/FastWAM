@@ -10,7 +10,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
-from .utils.samplers import ResumableEpochSampler
+from .utils.samplers import ResumableEpochSampler, ResumableStratifiedConcatSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -36,6 +36,8 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        self.dataloader_prefetch_factor = int(cfg.get("dataloader_prefetch_factor", 2))
+        self.dataloader_persistent_workers = bool(cfg.get("dataloader_persistent_workers", False))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -55,6 +57,8 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        swanlab_cfg = cfg.get("swanlab")
+        self.swanlab_enabled = bool(swanlab_cfg is not None and swanlab_cfg.get("enabled", False))
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -122,7 +126,10 @@ class Wan22Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
+        self.swanlab_run = None
+        self.swanlab = None
         self._init_wandb()
+        self._init_swanlab()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -164,22 +171,106 @@ class Wan22Trainer:
         self.wandb_run.finish()
         self.wandb_run = None
 
+    def _init_swanlab(self):
+        if not self.swanlab_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            import swanlab
+        except ImportError as e:
+            raise ImportError(
+                "SwanLab logging is enabled in config (`swanlab.enabled=true`) but swanlab is not installed."
+            ) from e
+
+        api_key = os.environ.get("SWANLAB_API_KEY")
+        host = None if self.cfg.swanlab.host in (None, "null", "") else str(self.cfg.swanlab.host)
+        if api_key:
+            swanlab.login(api_key=api_key, host=host, save=False)
+
+        self.swanlab = swanlab
+        self.swanlab_run = swanlab.init(
+            workspace=None if self.cfg.swanlab.workspace in (None, "null", "") else str(self.cfg.swanlab.workspace),
+            project=self.cfg.swanlab.project,
+            name=self.cfg.swanlab.name,
+            group=None if self.cfg.swanlab.group in (None, "null", "") else str(self.cfg.swanlab.group),
+            mode=self.cfg.swanlab.mode,
+            log_dir=self.output_dir,
+            config=OmegaConf.to_container(self.cfg, resolve=True),
+        )
+        logger.info(
+            "Initialized SwanLab run: workspace=%s project=%s name=%s",
+            self.cfg.swanlab.workspace,
+            self.cfg.swanlab.project,
+            self.cfg.swanlab.name,
+        )
+
+    def _swanlab_log(self, payload: dict):
+        if self.swanlab_run is None or self.swanlab is None:
+            return
+        self.swanlab.log(payload, step=self.global_step)
+
+    def _finish_swanlab(self):
+        if self.swanlab_run is None:
+            return
+        finish = getattr(self.swanlab_run, "finish", None)
+        if callable(finish):
+            finish()
+        elif self.swanlab is not None and hasattr(self.swanlab, "finish"):
+            self.swanlab.finish()
+        self.swanlab_run = None
+
+    def _log_metrics(self, payload: dict):
+        self._wandb_log(payload)
+        self._swanlab_log(payload)
+
+    def _finish_loggers(self):
+        self._finish_wandb()
+        self._finish_swanlab()
+
     def _build_loader(self, dataset, worker_init_fn=None):
-        self.train_sampler = ResumableEpochSampler(
-            dataset=dataset,
-            seed=self.seed,
-            batch_size=self.batch_size,
-            num_processes=self.accelerator.num_processes,
-        )
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            sampler=self.train_sampler,
-            num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            worker_init_fn=worker_init_fn,
-        )
+        stratified_cfg = None
+        if self.cfg.get("data") is not None and self.cfg.data.get("train") is not None:
+            stratified_cfg = self.cfg.data.train.get("stratified_batch")
+
+        if stratified_cfg is not None and bool(stratified_cfg.get("enabled", False)):
+            child_indices = list(stratified_cfg.get("child_indices", []))
+            min_fraction = float(stratified_cfg.get("min_fraction", 0.0))
+            self.train_sampler = ResumableStratifiedConcatSampler(
+                dataset=dataset,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+                child_indices=child_indices,
+                min_fraction=min_fraction,
+            )
+            logger.info(
+                "Using stratified concat sampler: child_indices=%s min_fraction=%.4f natural_fraction=%.4f target_fraction=%.4f effective_fraction=%.4f target_per_batch=%d batch_size=%d",
+                child_indices,
+                min_fraction,
+                self.train_sampler.natural_target_fraction,
+                self.train_sampler.target_fraction,
+                self.train_sampler.effective_target_fraction,
+                self.train_sampler.target_per_batch,
+                self.batch_size,
+            )
+        else:
+            self.train_sampler = ResumableEpochSampler(
+                dataset=dataset,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+            )
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "sampler": self.train_sampler,
+            "num_workers": self.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "worker_init_fn": worker_init_fn,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.dataloader_prefetch_factor
+            loader_kwargs["persistent_workers"] = self.dataloader_persistent_workers
+        return DataLoader(dataset, **loader_kwargs)
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         if not hasattr(dataset, "__len__"):
@@ -723,7 +814,7 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
+                        self._log_metrics(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -757,7 +848,7 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            self._wandb_log(eval_payload)
+                            self._log_metrics(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -778,6 +869,7 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
+                        self._finish_loggers()
                         return
 
         ckpt_info = self.save_checkpoint()
@@ -788,4 +880,5 @@ class Wan22Trainer:
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
+        self._finish_loggers()
         

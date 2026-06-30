@@ -61,6 +61,8 @@ class FastWAMIDM(FastWAMJoint):
         batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        action_context = inputs["action_context"]
+        action_context_mask = inputs["action_context_mask"]
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
@@ -135,8 +137,8 @@ class FastWAMIDM(FastWAMJoint):
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
             timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            context=action_context,
+            context_mask=action_context_mask,
         )
 
         noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])

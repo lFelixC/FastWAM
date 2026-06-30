@@ -22,6 +22,17 @@ logger = get_logger(__name__)
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
+
+def format_prompt_template(template: str, task: str) -> str:
+    first_line = str(task).strip().splitlines()[0] if str(task).strip() else ""
+    original_prompt = DEFAULT_PROMPT.format(task=task)
+    return str(template).format(
+        task=task,
+        first_line=first_line,
+        original_prompt=original_prompt,
+    )
+
+
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -42,6 +53,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        prompt_template: str = DEFAULT_PROMPT,
+        action_prompt_template: Optional[str] = None,
+        fallback_on_error: bool = True,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +86,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.prompt_template = prompt_template
+        self.action_prompt_template = action_prompt_template
+        self.fallback_on_error = bool(fallback_on_error)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -213,20 +230,35 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
-        instruction = DEFAULT_PROMPT.format(task=task)
+        instruction = format_prompt_template(self.prompt_template, task)
+        if self.action_prompt_template is None:
+            action_instruction = instruction
+        else:
+            action_instruction = format_prompt_template(self.action_prompt_template, task)
 
         context, context_mask = self._get_cached_text_context(instruction)
         # NOTE: to keep consistent with wan2.2's behavior
         context[~context_mask] = 0.0
         context_mask = torch.ones_like(context_mask)
+
+        if action_instruction == instruction:
+            action_context = context
+            action_context_mask = context_mask
+        else:
+            action_context, action_context_mask = self._get_cached_text_context(action_instruction)
+            action_context[~action_context_mask] = 0.0
+            action_context_mask = torch.ones_like(action_context_mask)
         
         data = {
             "video": video,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
+            "action_prompt": action_instruction,
             "context": context,
             "context_mask": context_mask,
+            "action_context": action_context,
+            "action_context_mask": action_context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
@@ -271,6 +303,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
+            if not self.fallback_on_error:
+                raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

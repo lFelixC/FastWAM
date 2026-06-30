@@ -282,6 +282,8 @@ class FastWAM(torch.nn.Module):
             )
         context = sample["context"]
         context_mask = sample["context_mask"]
+        action_context = sample.get("action_context", context)
+        action_context_mask = sample.get("action_context_mask", context_mask)
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -347,8 +349,20 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
             )
+        if action_context.ndim != 3 or action_context_mask.ndim != 2:
+            raise ValueError(
+                "`action_context/action_context_mask` must be [B,L,D]/[B,L], "
+                f"got {tuple(action_context.shape)} and {tuple(action_context_mask.shape)}"
+            )
+        if action_context.shape[0] != batch_size or action_context_mask.shape[0] != batch_size:
+            raise ValueError(
+                "`action_context/action_context_mask` batch dimension must match video batch size, "
+                f"got {tuple(action_context.shape)} and {tuple(action_context_mask.shape)} vs batch={batch_size}"
+            )
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        action_context = action_context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        action_context_mask = action_context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
@@ -364,6 +378,11 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
             )
+            action_context, action_context_mask = self._append_proprio_to_context(
+                context=action_context,
+                context_mask=action_context_mask,
+                proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+            )
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         if action_is_pad is not None:
@@ -374,6 +393,8 @@ class FastWAM(torch.nn.Module):
         return {
             "context": context,
             "context_mask": context_mask,
+            "action_context": action_context,
+            "action_context_mask": action_context_mask,
             "input_latents": input_latents,
             "first_frame_latents": first_frame_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
@@ -451,6 +472,8 @@ class FastWAM(torch.nn.Module):
         batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        action_context = inputs["action_context"]
+        action_context_mask = inputs["action_context_mask"]
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
@@ -488,8 +511,8 @@ class FastWAM(torch.nn.Module):
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
             timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            context=action_context,
+            context_mask=action_context_mask,
         )
 
         video_tokens = video_pre["tokens"]
