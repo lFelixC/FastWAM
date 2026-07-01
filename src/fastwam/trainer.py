@@ -86,6 +86,9 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
+        prior_head = getattr(self.model, "action_prior_head", None)
+        if prior_head is not None:
+            trainable_params.extend(list(prior_head.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -293,6 +296,10 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        prior_head = getattr(model, "action_prior_head", None)
+        if prior_head is not None:
+            prior_head.train()
+            prior_head.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):

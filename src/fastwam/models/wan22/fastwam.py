@@ -239,6 +239,71 @@ class FastWAM(torch.nn.Module):
             torch.cat([context_mask, proprio_mask], dim=1),
         )
 
+    def _action_source_type(self) -> str:
+        src_cfg = getattr(self, "action_source_cfg", {"type": "gaussian"})
+        if not hasattr(src_cfg, "get"):
+            return "gaussian"
+        return str(src_cfg.get("type", "gaussian")).strip().lower()
+
+    def _action_prior_from_proprio(self, proprio: Optional[torch.Tensor], horizon: int) -> torch.Tensor:
+        if proprio is None:
+            raise ValueError("`action_source.type=low_freq_prior` requires `proprio`.")
+        prior_head = getattr(self, "action_prior_head", None)
+        if prior_head is None:
+            raise RuntimeError("`action_source.type=low_freq_prior` requires `action_prior_head`.")
+        if self.proprio_dim is None:
+            raise ValueError("`action_source.type=low_freq_prior` requires `proprio_dim`.")
+
+        if proprio.ndim == 3:
+            cond = proprio[:, 0, :]
+        elif proprio.ndim == 2:
+            cond = proprio
+        elif proprio.ndim == 1:
+            cond = proprio.unsqueeze(0)
+        else:
+            raise ValueError(f"`proprio` must be [B,T,D], [B,D], or [D], got shape {tuple(proprio.shape)}")
+        if cond.shape[-1] != self.proprio_dim:
+            raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {cond.shape[-1]}")
+        cond = cond.to(device=self.device, dtype=self.torch_dtype)
+        return prior_head(cond, horizon=horizon)
+
+    def _init_action_latents(
+        self,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor],
+        *,
+        generator: Optional[torch.Generator],
+        rand_device: str,
+    ) -> torch.Tensor:
+        action_shape = (1, action_horizon, self.action_expert.action_dim)
+        source_type = self._action_source_type()
+        if source_type == "low_freq_prior":
+            latents_action = self._action_prior_from_proprio(proprio, horizon=action_horizon)
+            if latents_action.shape != action_shape:
+                raise ValueError(
+                    "Action prior shape mismatch: "
+                    f"expected {action_shape}, got {tuple(latents_action.shape)}."
+                )
+            prior_noise_scale = float(getattr(self.action_prior_head, "prior_noise_scale", 0.0))
+            if prior_noise_scale > 0:
+                prior_noise = torch.randn(
+                    action_shape,
+                    generator=generator,
+                    device=rand_device,
+                    dtype=torch.float32,
+                ).to(device=self.device, dtype=self.torch_dtype)
+                latents_action = latents_action + prior_noise_scale * prior_noise
+            return latents_action.to(device=self.device, dtype=self.torch_dtype)
+
+        if source_type == "gaussian":
+            return torch.randn(
+                action_shape,
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
+        raise ValueError(f"Unsupported `action_source.type`: {source_type}")
+
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         z = self.vae.encode(
@@ -467,14 +532,25 @@ class FastWAM(torch.nn.Module):
         if inputs["first_frame_latents"] is not None:
             latents[:, :, 0:1] = inputs["first_frame_latents"]
 
-        noise_action = torch.randn_like(action)
+        source_type = self._action_source_type()
+        if source_type == "low_freq_prior":
+            a_prior = self._action_prior_from_proprio(sample.get("proprio"), horizon=action.shape[1])
+            source_action = a_prior.detach()
+            prior_noise_scale = float(getattr(self.action_prior_head, "prior_noise_scale", 0.0))
+            if prior_noise_scale > 0:
+                source_action = source_action + prior_noise_scale * torch.randn_like(action)
+        elif source_type == "gaussian":
+            a_prior = None
+            source_action = torch.randn_like(action)
+        else:
+            raise ValueError(f"Unsupported `action_source.type`: {source_type}")
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=action.dtype,
         )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
-        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        noisy_action = self.train_action_scheduler.add_noise(action, source_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, source_action, timestep_action)
 
         video_pre = self.video_expert.pre_dit(
             x=latents,
@@ -565,6 +641,21 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if source_type == "low_freq_prior":
+            gt_lowpass = self.action_prior_head.lowpass_target(action)
+            prior_loss_token = F.mse_loss(a_prior.float(), gt_lowpass.float(), reduction="none").mean(dim=2)
+            if action_is_pad is not None:
+                valid = (~action_is_pad).to(device=prior_loss_token.device, dtype=prior_loss_token.dtype)
+                valid_sum = valid.sum(dim=1).clamp(min=1.0)
+                prior_loss_per_sample = (prior_loss_token * valid).sum(dim=1) / valid_sum
+            else:
+                prior_loss_per_sample = prior_loss_token.mean(dim=1)
+            loss_prior = prior_loss_per_sample.mean()
+            src_cfg = getattr(self, "action_source_cfg", {})
+            loss_weight = float(src_cfg.get("loss_weight", 1.0)) if hasattr(src_cfg, "get") else 1.0
+            loss_total = loss_total + loss_weight * loss_prior
+            loss_dict["loss_prior"] = float(loss_prior.detach().item())
+            loss_dict["loss_prior_weighted"] = loss_weight * float(loss_prior.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -810,12 +901,12 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
+        latents_action = self._init_action_latents(
+            action_horizon=action_horizon,
+            proprio=proprio,
             generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+            rand_device=rand_device,
+        )
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -950,12 +1041,12 @@ class FastWAM(torch.nn.Module):
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
+        latents_action = self._init_action_latents(
+            action_horizon=action_horizon,
+            proprio=proprio,
             generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+            rand_device=rand_device,
+        )
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -1093,6 +1184,9 @@ class FastWAM(torch.nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        action_prior_head = getattr(self, "action_prior_head", None)
+        if action_prior_head is not None:
+            payload["action_prior_head"] = action_prior_head.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1113,6 +1207,15 @@ class FastWAM(torch.nn.Module):
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        action_prior_head = getattr(self, "action_prior_head", None)
+        if action_prior_head is not None:
+            if "action_prior_head" in payload:
+                action_prior_head.load_state_dict(payload["action_prior_head"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `action_prior_head` weights; keeping current `action_prior_head` params.")
+        elif "action_prior_head" in payload:
+            logger.warning("Checkpoint contains `action_prior_head` weights but current model has no action prior; ignoring.")
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

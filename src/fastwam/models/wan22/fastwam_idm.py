@@ -79,14 +79,25 @@ class FastWAMIDM(FastWAMJoint):
             latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
 
         # Branch B: noisy action.
-        noise_action = torch.randn_like(action)
+        source_type = self._action_source_type()
+        if source_type == "low_freq_prior":
+            a_prior = self._action_prior_from_proprio(sample.get("proprio"), horizon=action.shape[1])
+            source_action = a_prior.detach()
+            prior_noise_scale = float(getattr(self.action_prior_head, "prior_noise_scale", 0.0))
+            if prior_noise_scale > 0:
+                source_action = source_action + prior_noise_scale * torch.randn_like(action)
+        elif source_type == "gaussian":
+            a_prior = None
+            source_action = torch.randn_like(action)
+        else:
+            raise ValueError(f"Unsupported `action_source.type`: {source_type}")
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=action.dtype,
         )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
-        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        noisy_action = self.train_action_scheduler.add_noise(action, source_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, source_action, timestep_action)
 
         # Branch C: teacher-forcing cond-video.
         # Each sample is independently noised with probability `video_cond_noise_prob`.
@@ -224,6 +235,23 @@ class FastWAMIDM(FastWAMJoint):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if source_type == "low_freq_prior":
+            if a_prior is None:
+                raise RuntimeError("Internal error: missing `a_prior` for low_freq_prior source.")
+            gt_lowpass = self.action_prior_head.lowpass_target(action)
+            prior_loss_token = F.mse_loss(a_prior.float(), gt_lowpass.float(), reduction="none").mean(dim=2)
+            if action_is_pad is not None:
+                valid = (~action_is_pad).to(device=prior_loss_token.device, dtype=prior_loss_token.dtype)
+                valid_sum = valid.sum(dim=1).clamp(min=1.0)
+                prior_loss_per_sample = (prior_loss_token * valid).sum(dim=1) / valid_sum
+            else:
+                prior_loss_per_sample = prior_loss_token.mean(dim=1)
+            loss_prior = prior_loss_per_sample.mean()
+            src_cfg = getattr(self, "action_source_cfg", {})
+            loss_weight = float(src_cfg.get("loss_weight", 1.0)) if hasattr(src_cfg, "get") else 1.0
+            loss_total = loss_total + loss_weight * loss_prior
+            loss_dict["loss_prior"] = float(loss_prior.detach().item())
+            loss_dict["loss_prior_weighted"] = loss_weight * float(loss_prior.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -336,12 +364,12 @@ class FastWAMIDM(FastWAMJoint):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
+        latents_action = self._init_action_latents(
+            action_horizon=action_horizon,
+            proprio=proprio,
             generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+            rand_device=rand_device,
+        )
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)

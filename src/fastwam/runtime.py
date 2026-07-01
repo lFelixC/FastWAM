@@ -40,6 +40,17 @@ def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _validate_action_prior_horizon(action_source: dict, action_horizon: int | None) -> None:
+    if action_horizon is None:
+        return
+    horizon = int(action_horizon)
+    if horizon <= 0:
+        raise ValueError(f"`action_horizon` must be > 0 when provided, got {horizon}.")
+    num_freq = int(action_source["num_freq"])
+    if num_freq > horizon:
+        raise ValueError(f"`action_source.num_freq` ({num_freq}) must be <= action_horizon ({horizon}).")
+
+
 def create_wan22_model(
     model_id: str,
     tokenizer_model_id: str,
@@ -85,6 +96,8 @@ def create_fastwam(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    action_horizon: int | None = None,
+    action_source=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -126,6 +139,13 @@ def create_fastwam(
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
 
+    if isinstance(action_source, DictConfig):
+        action_source = OmegaConf.to_container(action_source, resolve=True)
+    if action_source is None:
+        action_source = {"type": "gaussian"}
+    if not isinstance(action_source, dict):
+        raise ValueError(f"`action_source` must be dict-like, got {type(action_source)}")
+
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
     if loss is None:
@@ -133,7 +153,7 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAM.from_wan22_pretrained(
+    model = FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -156,6 +176,33 @@ def create_fastwam(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
     )
+    source_type = str(action_source.get("type", "gaussian")).strip().lower()
+    if source_type == "low_freq_prior":
+        from .models.wan22.action_prior import ActionPriorHead
+
+        if proprio_dim is None:
+            raise ValueError("`model.action_source.type=low_freq_prior` requires `proprio_dim`.")
+        action_dim = action_dit_config.get("action_dim")
+        if action_dim is None:
+            raise ValueError("`action_dit_config.action_dim` is required for low_freq_prior.")
+        if "num_freq" not in action_source:
+            raise ValueError("`action_source.num_freq` is required for low_freq_prior.")
+        _validate_action_prior_horizon(action_source, action_horizon)
+        model.action_source_cfg = dict(action_source)
+        model.action_source_cfg["type"] = source_type
+        model.action_prior_head = ActionPriorHead(
+            cond_dim=int(proprio_dim),
+            action_dim=int(action_dim),
+            num_freq=int(action_source["num_freq"]),
+            hidden=int(action_source.get("hidden_dim", 256)),
+            num_layers=int(action_source.get("num_layers", 2)),
+            prior_noise_scale=float(action_source.get("prior_noise_scale", 0.0)),
+        ).to(device=device, dtype=model_dtype)
+    elif source_type == "gaussian":
+        model.action_source_cfg = {"type": "gaussian"}
+    else:
+        raise ValueError(f"Unsupported `action_source.type`: {action_source.get('type')}")
+    return model
 
 
 def create_fastwam_joint(
@@ -255,6 +302,8 @@ def create_fastwam_idm(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    action_horizon: int | None = None,
+    action_source=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -305,7 +354,14 @@ def create_fastwam_idm(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAMIDM.from_wan22_pretrained(
+    if isinstance(action_source, DictConfig):
+        action_source = OmegaConf.to_container(action_source, resolve=True)
+    if action_source is None:
+        action_source = {"type": "gaussian"}
+    if not isinstance(action_source, dict):
+        raise ValueError(f"`action_source` must be dict-like, got {type(action_source)}")
+
+    model = FastWAMIDM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -328,6 +384,32 @@ def create_fastwam_idm(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
     )
+    source_type = str(action_source.get("type", "gaussian")).strip().lower()
+    if source_type == "low_freq_prior":
+        from .models.wan22.action_prior import ActionPriorHead
+
+        if proprio_dim is None:
+            raise ValueError("`model.action_source.type=low_freq_prior` requires `proprio_dim`.")
+        if "action_dim" not in action_dit_config:
+            raise ValueError("`action_dit_config.action_dim` is required for low_freq_prior.")
+        if "num_freq" not in action_source:
+            raise ValueError("`action_source.num_freq` is required for low_freq_prior.")
+        _validate_action_prior_horizon(action_source, action_horizon)
+        model.action_source_cfg = dict(action_source)
+        model.action_source_cfg["type"] = source_type
+        model.action_prior_head = ActionPriorHead(
+            cond_dim=int(proprio_dim),
+            action_dim=int(action_dit_config["action_dim"]),
+            num_freq=int(action_source["num_freq"]),
+            hidden=int(action_source.get("hidden_dim", 256)),
+            num_layers=int(action_source.get("num_layers", 2)),
+            prior_noise_scale=float(action_source.get("prior_noise_scale", 0.0)),
+        ).to(device=device, dtype=model_dtype)
+    elif source_type == "gaussian":
+        model.action_source_cfg = {"type": "gaussian"}
+    else:
+        raise ValueError(f"Unsupported `action_source.type`: {action_source.get('type')}")
+    return model
 
 
 def build_datasets(data_cfg: DictConfig):

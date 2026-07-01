@@ -54,5 +54,14 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+action_horizon: ${eval:'${data.train.num_frames} - 1'}
+action_source:
+  type: gaussian
+  num_freq: 6
+  hidden_dim: 256
+  num_layers: 2
+  prior_noise_scale: 0.0
+  loss_weight: 1.0
+
 loss:
   lambda_action: 1.0
